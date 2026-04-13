@@ -1,0 +1,173 @@
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-production}
+  PORT: ${PORT:-3000}
+  DB_HOST: ${DB_HOST:-yape-postgres}
+  DB_PORT: ${DB_PORT:-5432}
+  DB_USER: ${DB_USER:-postgres}
+  DB_PASSWORD: ${DB_PASSWORD:-postgres}
+  DB_NAME: ${DB_NAME:-yape}
+  KAFKA_BROKERS: ${KAFKA_BROKERS:-yape-kafka:9092}
+  KAFKA_GROUP_PREFIX: ${KAFKA_GROUP_PREFIX:-challenge}
+  SUPPORTED_COUNTRIES: ${SUPPORTED_COUNTRIES:-pe,mx}
+  RELAY_POLL_MS: ${RELAY_POLL_MS:-1000}
+  MAX_CONSUMER_RETRIES: ${MAX_CONSUMER_RETRIES:-3}
+  COUNTRY_NAMESPACE_ENABLED: ${COUNTRY_NAMESPACE_ENABLED:-true}
+
+x-app-service: &app-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+    topic-init:
+      condition: service_completed_successfully
+  networks: [yape-shared]
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: yape-postgres
+    profiles: ["core", "all", "db"]
+    environment:
+      POSTGRES_DB: ${DB_NAME:-yape}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [yape-shared]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-yape}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: yape-kafka
+    profiles: ["core", "all", "kafka"]
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-4L6g3nShT-eMCtK--X86sw}
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://yape-kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@yape-kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [yape-shared]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: yape-kafka-ui
+    profiles: ["kafka-ui", "all"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: yape-kafka:9092
+    ports:
+      - "8080:8080"
+    networks: [yape-shared]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  topic-init:
+    image: apache/kafka:3.9.0
+    container_name: yape-topic-init
+    profiles: ["init-topics", "all"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: yape-kafka:9092
+      SUPPORTED_COUNTRIES: ${SUPPORTED_COUNTRIES:-pe,mx}
+      TOPIC_PARTITIONS: ${TOPIC_PARTITIONS:-3}
+      TOPIC_REPLICATION_FACTOR: ${TOPIC_REPLICATION_FACTOR:-1}
+    volumes:
+      - ./scripts/init-topics.sh:/init-topics.sh:ro
+    networks: [yape-shared]
+    entrypoint: ["/bin/bash", "/init-topics.sh"]
+
+  payment-api:
+    <<: *app-service
+    container_name: yape-payment-api
+    profiles: ["payment-api", "all"]
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      <<: *app-env
+      KAFKA_CLIENT_ID: ${PAYMENT_API_CLIENT_ID:-payment-api}
+    command: ["npm", "run", "start:payment-api"]
+
+  outbox-relay:
+    <<: *app-service
+    container_name: yape-outbox-relay
+    profiles: ["outbox-relay", "all"]
+    environment:
+      <<: *app-env
+      KAFKA_CLIENT_ID: ${OUTBOX_RELAY_CLIENT_ID:-outbox-relay}
+    command: ["npm", "run", "start:outbox-relay"]
+
+  fraud-consumer:
+    <<: *app-service
+    container_name: yape-fraud-consumer
+    profiles: ["fraud-consumer", "all"]
+    environment:
+      <<: *app-env
+      KAFKA_CLIENT_ID: ${FRAUD_CLIENT_ID:-fraud-consumer}
+    command: ["npm", "run", "start:fraud-consumer"]
+
+  visual-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.visual-demo
+    container_name: yape-visual-demo
+    profiles: ["visual-demo", "all"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      payment-api:
+        condition: service_started
+    environment:
+      PORT: 4000
+      PAYMENT_API_URL: http://payment-api:3000
+      KAFKA_CONTAINER: yape-kafka
+      POSTGRES_CONTAINER: yape-postgres
+      SUPPORTED_COUNTRIES: ${SUPPORTED_COUNTRIES:-pe,mx}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-yape}
+    ports:
+      - "4000:4000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [yape-shared]
+
+networks:
+  yape-shared:
+    name: yape-shared
+
+volumes:
+  postgres_data:
+  kafka_data:

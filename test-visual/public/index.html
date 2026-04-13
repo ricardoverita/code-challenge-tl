@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Yape Visual Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="phone" aria-label="Yape demo">
+        <div class="status-bar">
+          <span>12:30</span>
+          <span class="signal">LTE</span>
+        </div>
+
+        <div class="topbar">
+          <button class="ghost-button" type="button" aria-label="Volver">‹</button>
+          <strong>Yapear a</strong>
+          <button class="ghost-button" type="button" aria-label="Cerrar">×</button>
+        </div>
+
+        <div id="paymentForm" class="payment-form">
+          <label class="recipient-label" for="recipient">Nombre</label>
+          <input id="recipient" class="recipient-input" value="Ricardo V*" maxlength="32" />
+
+          <div class="amount-line">
+            <select id="currency" class="currency-select">
+              <option value="PEN">S/</option>
+              <option value="MXN">$</option>
+              <option value="USD">US$</option>
+            </select>
+            <input id="amount" class="amount-input" type="number" min="1" step="0.01" value="25" />
+          </div>
+
+          <p class="limit-copy">Limite por yapeo S/500, limite total por dia S/2,000</p>
+
+          <div class="form-row">
+            <label>
+              Pais
+              <select id="country">
+                <option value="pe">PE</option>
+                <option value="mx">MX</option>
+              </select>
+            </label>
+
+            <label>
+              Escenario
+              <select id="scenario">
+                <option value="success">Success: settled</option>
+                <option value="fraud-rejected">Fraud rejected: failed</option>
+                <option value="ledger-down-recovery">Ledger down + retry</option>
+                <option value="timeout-pending">Timeout: pending honesto</option>
+                <option value="dlt-invalid-payload">DLT: payload invalido</option>
+                <option value="idempotency-replay">Replay: idempotencia</option>
+                <option value="country-isolation">Pais aislado</option>
+                <option value="mx-outage-pe-available">MX caido, PE disponible</option>
+              </select>
+            </label>
+          </div>
+
+          <input id="message" class="message-input" value="Demo payment settlement pipeline" />
+
+          <div class="actions">
+            <button id="resetButton" class="outline-button" type="button">Reset</button>
+            <button id="yapearButton" class="primary-button" type="button">Yapear</button>
+          </div>
+
+          <div class="keypad" aria-hidden="true">
+            <span>1</span><span>2<br /><small>ABC</small></span><span>3<br /><small>DEF</small></span>
+            <span>4<br /><small>GHI</small></span><span>5<br /><small>JKL</small></span><span>6<br /><small>MNO</small></span>
+            <span>7<br /><small>PQRS</small></span><span>8<br /><small>TUV</small></span><span>9<br /><small>WXYZ</small></span>
+            <span class="zero">0</span>
+          </div>
+        </div>
+
+        <section id="phoneResult" class="phone-result hidden" aria-live="polite">
+          <div id="phoneResultIcon" class="result-icon processing">...</div>
+          <p id="phoneResultKicker" class="result-kicker">Procesando</p>
+          <h2 id="phoneResultTitle">Procesando tu yape</h2>
+          <p id="phoneResultAmount" class="result-amount">S/ 25.00</p>
+          <p id="phoneResultMeta" class="result-meta">PE · PEN</p>
+          <p id="phoneResultDetail" class="result-detail">Estamos esperando confirmacion del pipeline.</p>
+          <button id="phoneResultButton" class="primary-button" type="button">Volver a yapear</button>
+        </section>
+      </section>
+
+      <section class="ops">
+        <div class="ops-header">
+          <div>
+            <p class="eyebrow">Challenge 1</p>
+            <h1>Payment settlement pipeline</h1>
+          </div>
+          <a class="kafka-link" href="http://localhost:8080" target="_blank" rel="noreferrer">Kafka UI</a>
+        </div>
+
+        <div class="health-grid" id="healthGrid"></div>
+        <div class="country-availability" id="countryAvailability"></div>
+
+        <div class="timeline" id="timeline">
+          <span data-step="api">Payment API</span>
+          <span data-step="outbox">Outbox</span>
+          <span data-step="created">Kafka</span>
+          <span data-step="fraud">Fraud</span>
+          <span data-step="ledger">Ledger</span>
+          <span data-step="saga">Saga</span>
+          <span data-step="dlt">DLT</span>
+        </div>
+
+        <div class="service-map" id="serviceMap"></div>
+
+        <section class="narrator-panel">
+          <div class="panel-title">Modo seguimiento</div>
+          <p id="narratorText">Elige un escenario y presiona Yapear.</p>
+        </section>
+
+        <div class="panels">
+          <section class="console-panel">
+            <div class="panel-title">CMD en vivo</div>
+            <pre id="consoleOutput" class="console-output">Listo para yapear...</pre>
+          </section>
+
+          <section class="inspector-panel">
+            <div class="panel-title">Inspector de evento</div>
+            <pre id="eventInspector" class="event-inspector">{}</pre>
+          </section>
+        </div>
+
+        <section class="db-panel">
+          <div class="panel-title">Database Evidence</div>
+          <p class="db-copy">Aqui se muestran las filas reales que prueban outbox, idempotencia y consistencia eventual.</p>
+          <div id="dbEvidence" class="db-evidence">
+            <article class="db-empty">Ejecuta un escenario para ver payments, outbox_events, payment_steps y processed_events.</article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,42 @@
+x-country-env: &country-env
+  NODE_ENV: ${NODE_ENV:-production}
+  DB_HOST: ${DB_HOST:-yape-postgres}
+  DB_PORT: ${DB_PORT:-5432}
+  DB_USER: ${DB_USER:-postgres}
+  DB_PASSWORD: ${DB_PASSWORD:-postgres}
+  DB_NAME: ${DB_NAME:-yape}
+  KAFKA_BROKERS: ${KAFKA_BROKERS:-yape-kafka:9092}
+  KAFKA_GROUP_PREFIX: ${KAFKA_GROUP_PREFIX:-challenge}
+  SUPPORTED_COUNTRIES: ${SUPPORTED_COUNTRIES:-pe,mx}
+  MAX_CONSUMER_RETRIES: ${MAX_CONSUMER_RETRIES:-3}
+  COUNTRY_NAMESPACE_ENABLED: ${COUNTRY_NAMESPACE_ENABLED:-true}
+  CONSUMER_COUNTRY: ${COUNTRY_CODE:?COUNTRY_CODE is required}
+  COUNTRY_CURRENCY: ${COUNTRY_CURRENCY:?COUNTRY_CURRENCY is required}
+
+x-country-service: &country-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  networks: [yape-shared]
+
+services:
+  ledger-consumer:
+    <<: *country-service
+    profiles: ["country", "ledger"]
+    environment:
+      <<: *country-env
+      KAFKA_CLIENT_ID: ledger-consumer-${COUNTRY_CODE}
+    command: ["npm", "run", "start:ledger-consumer"]
+
+  status-saga:
+    <<: *country-service
+    profiles: ["country", "saga"]
+    environment:
+      <<: *country-env
+      KAFKA_CLIENT_ID: status-saga-${COUNTRY_CODE}
+    command: ["npm", "run", "start:status-saga"]
+
+networks:
+  yape-shared:
+    external: true
+    name: yape-shared

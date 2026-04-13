@@ -1,197 +1,370 @@
-# Yape Code Challenge 🚀
+# Challenge 1 - Payment settlement pipeline
 
-Welcome. This challenge is designed for experienced engineers being considered for **tech lead and staff-level** roles. It tests your ability to reason about distributed systems, event-driven architecture, and platform design — not just your ability to ship working code.
+## ¿Por qué elegí este challenge?
 
-There are three challenges. **Pick one.** Go deep rather than broad.
+Elegí el **Challenge 1 - Payment settlement pipeline** porque representa mejor los problemas que aparecen en un sistema fintech real: escrituras dobles, entrega confiable de eventos, redelivery, idempotencia, fallas parciales y consistencia eventual.
 
----
+No lo tomé como un ejercicio de endpoints CRUD. Lo tomé como un problema de garantías distribuidas: cómo crear un pago sin perder eventos, cómo procesarlo aunque Kafka reentregue mensajes, cómo responder un estado honesto mientras los consumidores terminan, y cómo aislar el impacto entre países cuando un servicio crítico falla o tiene alto tráfico.
 
-## Table of Contents
+También elegí este reto porque permite explicar trade-offs importantes de arquitectura. En pagos no basta con que el happy path funcione; el diseño debe seguir siendo correcto si el relay se cae, si un consumer procesa dos veces el mismo mensaje, si un país se degrada o si un mensaje termina siendo imposible de procesar.
 
-- [What we're evaluating](#what-were-evaluating)
-- [Challenge 1 — Payment settlement pipeline](#challenge-1--payment-settlement-pipeline)
-- [Challenge 2 — Wallet transfer with distributed saga](#challenge-2--wallet-transfer-with-distributed-saga)
-- [Challenge 3 — Shared platform library design](#challenge-3--shared-platform-library-design)
-- [Tech stack](#tech-stack)
-- [Submission](#submission)
+## Resumen de la solución
 
----
+La solución implementa un pipeline de settlement basado en eventos con estos componentes:
 
-## What we're evaluating
-
-We're not looking for a perfect system. We're looking for evidence that you think like a tech lead:
-
-- You treat trade-offs as first-class decisions, not implementation details.
-- You build for the engineer who reads your code six months from now, not for the PR reviewer today.
-- You can identify the antipattern in a brief before someone points it out to you.
-- You know what you deliberately left out — and why.
-
-Every challenge includes an **optional escalation**. It's genuinely optional; finishing the core well beats rushing to the escalation.
-
----
-
-## Challenge 1 — Payment settlement pipeline
-
-### Premise
-
-You're building the payment processing backbone for a multi-country wallet. A payment initiated in one country may touch ledger entries, fraud scoring, and notification services that are fully independent. Your solution must remain correct under partial failures and message redelivery.
-
-### Architecture overview
-
-
-```
-Payment API ──► Outbox table ──[relay]──► Kafka topic
-                                          (payment.created.v1)
-                                               │
-                          ┌────────────────────┼────────────────────┐
-                          ▼                    ▼                    ▼
-                   FraudConsumer        LedgerConsumer       NotifyConsumer
-                   (risk scoring)    (double-entry write)   (push / email)
-                          │                    │
-                          └────────┬───────────┘
-                                   ▼
-                             Status saga
-                          (eventual consistency)
-                               │
-                    ┌──────────┴──────────┐
-                    ▼ (on failure)        ▼ (on success)
-               DLT topic            payment.settled.v1
-          (payment.failed.v1)
+```text
+Payment API -> PostgreSQL outbox -> Outbox Relay -> Kafka -> Fraud / Ledger -> Status Saga -> settled | failed | DLT
 ```
 
-### Required deliverables
+Los procesos principales son:
 
-1. **Transactional outbox** — A `PaymentService` (NestJS) that writes a payment record and its outbox entry in a single local transaction. A separate relay process publishes to Kafka. The broker must never be called inside the database transaction.
+```text
+payment-api
+outbox-relay
+fraud-consumer
+ledger-consumer
+status-saga
+```
 
-2. **Idempotent consumers** — At least two downstream consumers (`FraudConsumer`, `LedgerConsumer`) in separate NestJS modules. Reprocessing the same event twice must produce no observable side effect.
+La solución también incluye Docker Compose, scripts de bootstrap local, tests automatizados, namespace por país, configuración por país y un demo visual tipo Yape que permite ejecutar escenarios reales y ver eventos Kafka, evidencia en base de datos y disponibilidad por país.
 
-3. **DLT handler** — When a consumer exceeds its retry budget, emit a compensating event to a Dead Letter Topic rather than silently dropping the message.
+## Decisiones arquitectónicas
 
-4. **Status query endpoint** — A GET endpoint that reflects eventual consistency honestly. A payment may return `pending` after creation and only transition to `settled` or `failed` once both consumers have acknowledged.
+### 1. Transactional Outbox
 
-### What a strong solution looks like
+Decidí usar el patrón **Transactional Outbox** para evitar el problema clásico de dual write:
 
-- The outbox relay is a distinct process boundary — not a `setInterval` in the same NestJS app.
-- Idempotency keys live on the consumer side (keyed by `eventId`), not on the producer side.
-- The status endpoint documents its consistency guarantees explicitly — either in code comments or in an API response envelope.
-- The candidate can explain what happens if the relay crashes between writing the outbox entry and publishing to Kafka.
+```text
+DB commit OK, pero Kafka publish falla
+```
 
-### What disqualifies a solution
+Cuando se crea un pago, el `PaymentService` guarda en la misma transacción local:
 
-- Calling `kafkaClient.emit()` directly inside a `@Transaction()` decorator. This is the most common mistake at this level and it produces silent data loss.
+```text
+payments
+outbox_events
+```
 
-### Optional escalation
+El broker no se llama dentro de esa transacción. Esto es importante porque llamar Kafka dentro de una transacción SQL no hace que Kafka participe de esa transacción; solo crea una falsa sensación de atomicidad.
 
-Add a per-country topic namespace (`pe.payments.payment.created.v1`, `mx.payments.payment.created.v1`) and document what that implies for consumer group strategy across countries.
+La alternativa rechazada fue publicar directamente a Kafka desde el API durante la creación del pago. Es más simple de programar, pero puede producir pérdida silenciosa de eventos si la base de datos confirma y el broker falla después.
 
----
+### 2. Relay separado del API
 
-## Challenge 2 — Wallet transfer with distributed saga
+El `outbox-relay` corre como proceso separado. Lee filas pendientes de `outbox_events`, publica a Kafka y marca la fila como publicada.
 
-### Premise
+Esta separación permite que el ciclo de vida del relay no dependa del API HTTP. También hace más claro el modelo de fallas:
 
-Transferring funds between two wallets in different countries requires debiting one ledger and crediting another atomically — without a distributed transaction. You will implement a saga that is safe to replay from any step.
+```text
+Si el relay muere antes de publicar, la fila queda pending y se reintenta.
+Si el relay publica pero muere antes de marcar published, el evento puede publicarse otra vez.
+Ese duplicado es aceptable porque los consumers son idempotentes.
+```
 
-### Required deliverables
+Para concurrencia en el relay se usa locking pesimista con `FOR UPDATE SKIP LOCKED`, de forma que varias instancias puedan reclamar lotes sin procesar la misma fila al mismo tiempo.
 
-1. **Transfer orchestrator** — Implement a `TransferOrchestrator` that drives the following steps in order:
+### 3. PostgreSQL como base de datos local
 
-   ```
-   DebitWallet → CreditWallet → SettleFX → EmitReceipt
-   ```
+Elegí PostgreSQL porque ofrece garantías ACID sólidas para la transacción local `payment + outbox`. Además soporta locks transaccionales como `FOR UPDATE SKIP LOCKED`, que encajan bien con un relay concurrente basado en polling.
 
-   You may use Temporal, a hand-rolled state machine, or pure Kafka choreography. You must justify the choice in writing.
+La alternativa de usar una base más simple o almacenamiento en memoria habría reducido la complejidad inicial, pero no demostraría bien las garantías transaccionales que el challenge busca evaluar.
 
-2. **Compensation on failure** — If `CreditWallet` fails after `DebitWallet` succeeds, the orchestrator must issue a `ReverseDebit` compensation event. Silent failure is not acceptable.
+### 4. Kafka con topics por país
 
-3. **CQRS read model** — A `TransferReadModel` updated via projected events, not by reading the write-side database. The read model must be consistent enough to serve a GET within 500ms of the saga completing.
+Implementé namespace por país para los topics:
 
-4. **Concurrency safety** — If two transfers attempt to debit the same wallet simultaneously, the second must detect the conflict and fail fast. A negative balance is never acceptable.
+```text
+pe.payments.payment.created.v1
+mx.payments.payment.created.v1
+pe.payments.fraud.assessed.v1
+mx.payments.fraud.assessed.v1
+pe.payments.ledger.posted.v1
+mx.payments.ledger.posted.v1
+```
 
-### What a strong solution looks like
+Esto permite separar tráfico, lag, DLTs y operación por país. Si MX tiene alto tráfico o una falla operativa, PE no debe quedar bloqueado por compartir el mismo flujo crítico.
 
-- The candidate picks a clear position on choreography vs. orchestration and can articulate the trade-off: choreography reduces coupling but makes the overall saga state invisible; orchestration makes state explicit but introduces a coordinator as a single point of failure.
-- The idempotency key is placed on the saga instance, not on individual commands, and the candidate can explain why.
-- The read model answers the question: "how do I know the read model isn't serving stale data immediately after the saga closes?" — whether via versioned events, a subscription mechanism, or a documented staleness window.
+La alternativa rechazada fue usar un único topic global con `countryCode` dentro del payload. Esa opción simplifica nombres de topics, pero mezcla lag y operación entre países, lo cual complica aislamiento y respuesta ante incidentes.
 
-### What disqualifies a solution
+### 5. Estrategia híbrida multi-país
 
-A single database transaction spanning two service databases. This is the antipattern the challenge is explicitly designed to surface.
+No elegí que todo fuera global ni que todo fuera aislado por país. Elegí una estrategia híbrida:
 
-### Optional escalation
+```text
+Globales:
+payment-api
+outbox-relay
+fraud-consumer
 
-Model the FX settlement step as an external API call with a timeout. Show how the saga handles a timeout that leaves the FX state ambiguous — neither confirmed nor rejected.
+Aislados por país:
+ledger-consumer
+status-saga
+```
 
----
+`fraud-consumer` se mantiene global porque en esta solución representa una evaluación compartida y de menor costo operativo. En cambio, `ledger-consumer` y `status-saga` están aislados por país porque son parte crítica del settlement y del cierre del estado del pago.
 
-## Challenge 3 — Shared platform library design
+La alternativa de aislar todo por país aumenta control operativo, pero también multiplica costo y complejidad desde el inicio. La alternativa de dejar todo global reduce costo, pero debilita el aislamiento ante picos o fallas localizadas.
 
-### Premise
+### 6. Consumer groups por país
 
-Your platform team owns the internal libraries that all product squads import. You've been asked to design and ship `@yape/kafka-module` — a NestJS dynamic module that wraps Kafka producer and consumer setup, enforces topic naming conventions, wires DLT automatically, and exposes typed event contracts. You are the only author. Four squads will consume it within the quarter.
+Los consumers críticos usan grupos por país:
 
-### Required deliverables
+```text
+challenge.ledger-consumer.pe
+challenge.ledger-consumer.mx
+challenge.status-saga.pe
+challenge.status-saga.mx
+```
 
-1. **Dynamic module API** — A `KafkaModule.forFeature({ topics, consumerGroup })` dynamic module. The module must register producers and consumers via NestJS dependency injection, not global singletons.
+El consumer global usa un grupo global:
 
-2. **`@KafkaEvent()` decorator** — A `@KafkaEvent(topicName)` decorator that binds a handler method to a Kafka consumer, analogous to how NestJS `@MessagePattern` works internally.
+```text
+challenge.fraud-consumer.global
+```
 
-3. **Automatic DLT wiring** — If a handler throws and exceeds `maxRetries`, the module routes the message to `{original-topic}.dlt` without any code change required in the consuming squad.
+Esto permite que el offset y el lag de los procesos críticos estén separados por país. También deja el sistema preparado para escalar horizontalmente un país sin tocar otro.
 
-4. **`EventContract<T>` type** — A generic type that enforces schema shape at compile time. Squads must not be able to publish to a topic with a payload that doesn't match the declared contract. A type mismatch must be a TypeScript compile error, not a runtime exception.
+Por ejemplo, si MX recibe más tráfico, puedo escalar los workers de MX sin escalar PE:
 
-5. **ADR (Architecture Decision Record)** — Written in MADR format, covering:
-   - Why NestJS dynamic modules over a plain exported class.
-   - How you handle schema evolution without breaking consumers who still reference an older version.
-   - What you would add with two more weeks.
+```bash
+docker compose -p yape-mx -f docker-compose.country.yml --env-file .env --env-file .env.mx --profile country up -d --scale ledger-consumer=3 --scale status-saga=2
+```
 
-### What a strong solution looks like
+No implementé autoscaling automático porque el reto apunta a un entorno local con Docker Compose. En producción agregaría HPA basado en consumer lag, retry rate, CPU y latencia por país.
 
-- The module API feels native to NestJS. A squad importing it should not need to understand Kafka internals to publish an event.
-- Schema evolution is addressed concretely: additive fields, topic versioning (`payment.created.v2`), or a schema registry — the candidate picks one and defends it, with trade-offs acknowledged.
-- The ADR reads like it was written for a real team, not as a post-hoc justification. It documents the options that were rejected and why.
+### 7. Idempotencia del lado consumidor
 
-### What a weak solution looks like
+La idempotencia vive del lado consumidor, no del productor. Cada consumer registra una marca en `processed_events` antes de generar efectos observables.
 
-- The module wraps Kafka imperatively and tells squads to call `producer.send()` directly.
-- `EventContract<T>` is a runtime validation only (e.g. a Zod schema), with no compile-time enforcement.
-- The ADR is a bulleted list with no trade-off reasoning.
+La clave lógica es:
 
-### Optional escalation
+```text
+consumerName + countryCode + eventId
+```
 
-Publish the module to a local [Verdaccio](https://verdaccio.org/) registry. Document your versioning and release strategy, including how you would communicate breaking changes to consuming squads.
+Esto es más seguro que usar solo `eventId`, porque en un sistema multi-país se evita una colisión accidental entre eventos de distintos países. También es más correcto que deduplicar por `paymentId`, porque un mismo pago puede producir varios eventos distintos.
 
----
+La alternativa rechazada fue confiar solo en Kafka o en el productor para evitar duplicados. Kafka puede entregar más de una vez bajo ciertos escenarios; por eso cada consumer debe ser capaz de recibir el mismo evento nuevamente sin duplicar side effects.
 
-## Tech stack
+### 8. Status Saga basada en eventos
 
-The following is the expected stack. Deviations are acceptable if you document the reason.
+Implementé una `status-saga` que escucha:
 
-| Layer | Expected |
-|---|---|
-| Runtime | Node.js 20+ |
-| Framework | NestJS |
-| Messaging | Kafka (local via Docker, or Confluent Cloud) |
-| Database | Your choice — document why |
-| Orchestration | Temporal, native Kafka, or a state machine — justify the choice |
-| Language | TypeScript (strict mode) |
-| Containers | Docker Compose for local environment |
+```text
+fraud.assessed.v1
+ledger.posted.v1
+```
 
----
+La saga actualiza `payment_steps` y reconcilia el estado final del pago:
 
-## Submission
+```text
+fraud succeeded + ledger succeeded -> payment.settled.v1
+fraud failed o ledger failed -> payment.failed.v1
+faltan ACKs -> payment sigue pending
+```
 
-1. Fork this repository.
-2. Create a branch named `challenge/{your-name}`.
-3. Open a pull request against `main` in this repository.
+Esto hace que el endpoint de status sea honesto con la consistencia eventual. Un pago recién creado puede devolver `pending` hasta que los consumidores confirmen.
 
-Your PR description must include:
+La alternativa rechazada fue marcar el pago como `settled` inmediatamente después de publicarlo a Kafka. Eso sería incorrecto porque publicar un evento no significa que fraude y ledger ya hayan terminado.
 
-- Which challenge you chose and why.
-- The key architectural decisions you made and the alternatives you rejected.
-- What you would do differently with more time.
-- Any known limitations or shortcuts taken.
+### 9. DLT por topic original
 
-**There is no time limit stated intentionally.** A focused solution delivered in four hours tells us more than an exhaustive one delivered in two days. Prioritise depth of reasoning over breadth of features.
+Si un consumer agota su presupuesto de retries, el mensaje se envía a un Dead Letter Topic:
 
-If you have questions, open an issue on this repository. We respond to issues within one business day.
+```text
+{original-topic}.dlt
+```
+
+Ejemplos:
+
+```text
+pe.payments.payment.created.v1.dlt
+mx.payments.ledger.posted.v1.dlt
+```
+
+Esto evita perder mensajes silenciosamente. También conserva trazabilidad por país y por tipo de evento.
+
+Separé conceptualmente DLT de `payment.failed.v1`. El DLT representa una falla técnica de procesamiento o un mensaje inválido. `payment.failed.v1` representa un resultado de negocio o de saga donde el pago sí llegó a un estado terminal fallido.
+
+### 10. Configuración de país y moneda
+
+Cada país tiene su propio archivo de configuración:
+
+```text
+.env.pe -> COUNTRY_CODE=pe, COUNTRY_CURRENCY=PEN
+.env.mx -> COUNTRY_CODE=mx, COUNTRY_CURRENCY=MXN
+.env.co -> COUNTRY_CODE=co, COUNTRY_CURRENCY=COP
+```
+
+Decidí guardar la moneda en `.env.<pais>` porque la moneda default es una propiedad operativa del proceso país. Si mañana se agrega Colombia, no debería tocarse el código central para saber que `co` usa `COP`.
+
+Los scripts `init-local.sh` y `add-new-country.sh` preguntan y validan la moneda usando formato ISO de tres letras.
+
+### 11. Docker Compose reproducible
+
+Incluí un entorno local con Docker Compose para levantar infraestructura y servicios sin depender de instalaciones locales de Node o npm.
+
+La estructura está separada en dos capas:
+
+```text
+docker-compose.yml -> core compartido
+docker-compose.country.yml -> workers aislados por país
+```
+
+Esto evita duplicar YAML por cada país. Para agregar un país nuevo se crea `.env.<pais>` y se levanta el mismo compose con otro project name:
+
+```bash
+docker compose -p yape-co -f docker-compose.country.yml --env-file .env --env-file .env.co --profile country up -d --build
+```
+
+### 12. Visual demo para explicar el sistema
+
+Además de los tests, agregué un demo visual tipo Yape. No lo hice como reemplazo de pruebas, sino como herramienta de explicación.
+
+El demo permite ver al mismo tiempo:
+
+```text
+pantalla de usuario
+estado de servicios
+línea de tiempo del pipeline
+eventos Kafka
+evidencia en Postgres
+estado por país
+```
+
+También incluye escenarios como:
+
+```text
+success
+fraud rejected
+ledger down + retry
+timeout pending
+DLT invalid payload
+replay idempotente
+país aislado
+MX caído, PE disponible
+```
+
+El escenario `MX caído, PE disponible` apaga workers críticos de MX y ejecuta un pago PE. La intención es demostrar visualmente que una caída operativa en MX no afecta la disponibilidad del settlement de PE.
+
+## Alternativas rechazadas
+
+### Publicar en Kafka dentro de la transacción SQL
+
+La rechacé porque no garantiza atomicidad real entre PostgreSQL y Kafka. Si una parte falla, el sistema puede quedar inconsistente.
+
+### Usar una transacción distribuida o 2PC
+
+La rechacé porque aumenta complejidad y no es una solución práctica para este escenario local. El outbox ofrece una garantía suficiente y más operable: persistir primero, publicar después, y tolerar duplicados con idempotencia.
+
+### Usar Debezium o CDC desde el inicio
+
+CDC sería una buena evolución para reducir polling y mejorar throughput, pero para el challenge preferí una implementación explícita del relay. Es más fácil de revisar y deja clara la decisión de no llamar Kafka dentro del transaction boundary.
+
+### Usar Temporal
+
+Temporal sería útil para sagas más largas, con timers, compensaciones complejas y pasos externos ambiguos. Para este challenge, una saga ligera basada en eventos era suficiente y mantiene menos moving parts.
+
+### Hacer todos los servicios por país
+
+Lo rechacé como primera versión porque multiplica despliegues y costo operativo. Preferí aislar los procesos críticos y mantener globales los componentes que no necesitan aislamiento fuerte en esta etapa.
+
+### Hacer todo global
+
+También lo rechacé porque debilita el aislamiento. Si un país genera lag o tiene una falla de ledger, no debería impactar el cierre de pagos de otro país.
+
+### Usar BIAN como eje principal
+
+No modelé la solución bajo BIAN porque el challenge no lo pedía. Preferí concentrarme en garantías distribuidas, idempotencia, DLT, outbox y operación multi-país. Si la organización usa BIAN como marco de gobierno, los módulos podrían mapearse posteriormente a dominios como Payments, Fraud, Ledger y Notifications.
+
+## Qué pasa ante fallas
+
+### Si Kafka falla cuando se crea el pago
+
+No se pierde el pago ni el evento, porque el API no llama Kafka. El pago y la fila outbox ya quedaron persistidos en PostgreSQL. El relay seguirá intentando publicar cuando Kafka vuelva.
+
+### Si el relay muere antes de publicar
+
+La fila queda pendiente en `outbox_events`. Al reiniciar el relay, la fila se toma nuevamente y se publica.
+
+### Si el relay publica y muere antes de marcar published
+
+El evento puede publicarse otra vez. Este duplicado es tolerado porque Fraud, Ledger y Status Saga son idempotentes por `consumerName + countryCode + eventId`.
+
+### Si un consumer recibe el mismo evento dos veces
+
+Consulta `processed_events`. Si ya existe la marca de procesamiento, no ejecuta de nuevo el side effect.
+
+### Si un consumer agota retries
+
+El mensaje se envía al DLT correspondiente. No se descarta silenciosamente.
+
+### Si MX cae o tiene alto tráfico
+
+Los workers críticos de PE siguen con su propio consumer group y sus propios topics. El diseño permite operar y escalar por país.
+
+## Qué haría diferente con más tiempo
+
+- Agregaría migraciones TypeORM versionadas en lugar de depender de sincronización automática de esquema en local.
+- Agregaría Schema Registry o validación formal de contratos para eventos, con reglas de compatibilidad backward/forward.
+- Agregaría OpenTelemetry para trazabilidad end-to-end desde `POST /payments` hasta `payment.settled.v1` o DLT.
+- Agregaría métricas por país: consumer lag, retry rate, DLT rate, tiempo en pending y throughput por topic.
+- Agregaría dashboards y alertas por país para detectar degradación localizada.
+- Agregaría limpieza/retención de `processed_events` para controlar crecimiento de la tabla de idempotencia.
+- Evaluaría CDC con Debezium para reemplazar polling del outbox si el volumen crece.
+- Implementaría autoscaling en Kubernetes con HPA basado en Kafka lag por país.
+- Separaría físicamente bases o esquemas por dominio si el sistema evolucionara hacia microservicios más independientes.
+- Agregaría runbooks de replay de DLT y procedimientos seguros para reprocesamiento.
+
+## Limitaciones conocidas
+
+- Uso una sola base PostgreSQL para simplificar el entorno local del challenge. En producción, Ledger, Fraud y Payments podrían tener ownership de datos más separado.
+- Los eventos downstream de algunos workers se publican directamente desde el consumer. Con más tiempo aplicaría outbox también para esos eventos si se requiere la misma garantía fuerte que en `payment.created.v1`.
+- El entorno Kafka local usa una topología simple de desarrollo, no un cluster productivo multi-broker.
+- El relay usa polling. Es correcto para el challenge, pero en producción evaluaría CDC o tuning de polling/backoff.
+- El fraud scoring es intencionalmente simple. El foco del reto está en garantías distribuidas, no en un motor real de riesgo.
+- No implementé autenticación/autorización porque no era el foco del challenge.
+- No implementé autoscaling automático; dejé la arquitectura lista para escalar por país, pero las reglas productivas vivirían en Kubernetes/observabilidad.
+- El visual demo monta Docker socket para controlar containers en laboratorio local. Es útil para demostrar fallas, pero no es un patrón recomendado para producción.
+
+## Cómo validé la solución
+
+Incluí pruebas automatizadas para los puntos críticos:
+
+```text
+payment-service
+idempotency-consumers
+status-saga
+DLT handler
+```
+
+También agregué scripts para operación local:
+
+```bash
+./scripts/init-local.sh
+./scripts/run-test.sh
+./scripts/run-kafka-scenario.sh
+./scripts/add-new-country.sh
+./scripts/cleanup-docker.sh
+```
+
+Y un demo visual en:
+
+```text
+http://localhost:4000
+```
+
+El objetivo del demo visual es facilitar la explicación en entrevista: se puede ejecutar un pago, ver el evento en Kafka, ver las filas reales en Postgres y demostrar qué ocurre bajo fallas parciales.
+
+## Cierre
+
+La decisión principal fue priorizar garantías operativas sobre simplicidad superficial. El sistema acepta que Kafka puede redeliver, que los consumidores pueden fallar, que la consistencia es eventual y que un país puede degradarse sin bloquear a otro.
+
+La promesa de esta solución no es consistencia inmediata. La promesa es:
+
+```text
+no perder eventos,
+no duplicar efectos,
+reflejar el estado honestamente,
+y aislar fallas críticas por país.
+```
